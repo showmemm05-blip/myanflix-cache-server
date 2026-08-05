@@ -12,6 +12,33 @@ server {
         proxy_set_header Host $host;
         proxy_set_header Connection "";
 
+        # Wildcard, not an origin allowlist — this is read-only public HLS
+        # content; the real access control already happened earlier (the
+        # backend only hands a viewer a stream URL after checking movie
+        # ownership). CORS here only governs whether cross-origin JS can
+        # *read* the response, which the custom HLS prefetch player needs
+        # (it fetches via XHR/fetch, not a plain <video src>). Needed for
+        # any origin that legitimately runs userwebsite, present or future,
+        # without maintaining a per-environment origin list here too.
+        add_header Access-Control-Allow-Origin * always;
+        # Content-Range/Accept-Ranges: byte-range seeking. ETag: the
+        # player's own cache-freshness checks.
+        add_header Access-Control-Expose-Headers "Content-Range, Content-Length, Accept-Ranges, ETag" always;
+
+        # Preflight — browsers send this before a cross-origin GET that
+        # carries a Range header on some implementations. Answered here
+        # directly rather than forwarded upstream, since the storage origin
+        # has no OPTIONS handling of its own.
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Range, Content-Type" always;
+            add_header Access-Control-Max-Age 86400 always;
+            add_header Content-Length 0;
+            add_header Content-Type text/plain;
+            return 204;
+        }
+
         # Cache keyed on path only, ignoring the query string. Presigned
         # URLs carry a unique signature + expiry per request, so keying on
         # the full URL would give every viewer's link its own cache entry
