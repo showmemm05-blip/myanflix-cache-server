@@ -6,25 +6,86 @@ server {
     listen 8080;
     server_name _;
 
-    location / {
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Connection "";
+
+    # Wildcard, not an origin allowlist — this is read-only public HLS
+    # content; the real access control already happened earlier (the
+    # backend only hands a viewer a stream URL after checking movie
+    # ownership). CORS here only governs whether cross-origin JS can
+    # *read* the response, which the custom HLS prefetch player needs
+    # (it fetches via XHR/fetch, not a plain <video src>). Needed for
+    # any origin that legitimately runs userwebsite, present or future,
+    # without maintaining a per-environment origin list here too.
+    #
+    # Set at server level so both locations below inherit one identical set:
+    # an add_header anywhere inside a location would silently drop these.
+    add_header Access-Control-Allow-Origin * always;
+    # Content-Range/Accept-Ranges: byte-range seeking. ETag: the
+    # player's own cache-freshness checks.
+    add_header Access-Control-Expose-Headers "Content-Range, Content-Length, Accept-Ranges, ETag" always;
+    add_header X-Cache-Status $upstream_cache_status always;
+
+    # Cache keyed on path only, ignoring the query string. Presigned
+    # URLs carry a unique signature + expiry per request, so keying on
+    # the full URL would give every viewer's link its own cache entry
+    # and never actually share a hit — this way every viewer requesting
+    # the same segment hits the same cache entry.
+    #
+    # Known tradeoff: because of that, a cache HIT never reaches the
+    # storage origin, which means a cached response is served without
+    # re-checking whether *this specific* request's presigned signature
+    # is valid or expired. That's fine as long as permission is enforced
+    # before a URL is ever handed out (the app server only gives a
+    # viewer a URL after confirming they own the movie) — it stops being
+    # fine if this cache is ever treated as the sole access-control
+    # point. If per-request revocation ever matters, add a
+    # token-validation step (auth_request) in front of this location.
+    #
+    # It also means a cache-busting query string CANNOT be used to force a
+    # refresh of a mutable object — which is why freshness has to come from
+    # the TTL split below rather than from the publisher's URLs.
+    proxy_cache movie_cache;
+    proxy_cache_key "$scheme$request_method$host$uri";
+    proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+    proxy_cache_lock on;
+    proxy_cache_lock_timeout 30s;
+
+    # Playlists and subtitle text are MUTABLE at a stable key, unlike segment
+    # bytes. master.m3u8 in particular is rewritten in place every time a
+    # subtitle is added, renamed, made default, or deleted (the subtitle
+    # renditions live inside it as #EXT-X-MEDIA lines), and subs/<id>.vtt is
+    # republished alongside it. Under the 7d TTL below, every one of those
+    # edits would stay invisible for up to a week: a title whose master was
+    # fetched before its subtitle existed would serve the subtitle-free
+    # manifest, and after a delete the stale master would keep advertising a
+    # rendition whose objects are gone. A few seconds is short enough that an
+    # admin edit shows up on the next play, long enough to still absorb the
+    # herd at the start of a popular title.
+    location ~* \.(m3u8|vtt)$ {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Range, Content-Type" always;
+            add_header Access-Control-Max-Age 86400 always;
+            add_header Content-Length 0;
+            add_header Content-Type text/plain;
+            return 204;
+        }
+
         proxy_pass http://storage_origin;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header Connection "";
 
-        # Wildcard, not an origin allowlist — this is read-only public HLS
-        # content; the real access control already happened earlier (the
-        # backend only hands a viewer a stream URL after checking movie
-        # ownership). CORS here only governs whether cross-origin JS can
-        # *read* the response, which the custom HLS prefetch player needs
-        # (it fetches via XHR/fetch, not a plain <video src>). Needed for
-        # any origin that legitimately runs userwebsite, present or future,
-        # without maintaining a per-environment origin list here too.
-        add_header Access-Control-Allow-Origin * always;
-        # Content-Range/Accept-Ranges: byte-range seeking. ETag: the
-        # player's own cache-freshness checks.
-        add_header Access-Control-Expose-Headers "Content-Range, Content-Length, Accept-Ranges, ETag" always;
+        # proxy_cache_valid does not merge across levels — a location that
+        # sets one replaces every inherited rule, so both codes are restated.
+        proxy_cache_valid 200 206 10s;
+        proxy_cache_valid 404 1m;
+    }
 
+    # Everything else: media segments, images, and the rest of the bucket.
+    # These are written once under a content-addressed-enough key and never
+    # rewritten, so a long TTL is exactly right.
+    location / {
         # Preflight — browsers send this before a cross-origin GET that
         # carries a Range header on some implementations. Answered here
         # directly rather than forwarded upstream, since the storage origin
@@ -39,29 +100,9 @@ server {
             return 204;
         }
 
-        # Cache keyed on path only, ignoring the query string. Presigned
-        # URLs carry a unique signature + expiry per request, so keying on
-        # the full URL would give every viewer's link its own cache entry
-        # and never actually share a hit — this way every viewer requesting
-        # the same segment hits the same cache entry.
-        #
-        # Known tradeoff: because of that, a cache HIT never reaches the
-        # storage origin, which means a cached response is served without
-        # re-checking whether *this specific* request's presigned signature
-        # is valid or expired. That's fine as long as permission is enforced
-        # before a URL is ever handed out (the app server only gives a
-        # viewer a URL after confirming they own the movie) — it stops being
-        # fine if this cache is ever treated as the sole access-control
-        # point. If per-request revocation ever matters, add a
-        # token-validation step (auth_request) in front of this location.
-        proxy_cache movie_cache;
-        proxy_cache_key "$scheme$request_method$host$uri";
+        proxy_pass http://storage_origin;
+
         proxy_cache_valid 200 206 7d;
         proxy_cache_valid 404 1m;
-        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
-        proxy_cache_lock on;
-        proxy_cache_lock_timeout 30s;
-
-        add_header X-Cache-Status $upstream_cache_status always;
     }
 }
