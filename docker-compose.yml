@@ -12,6 +12,20 @@ services:
       # this at the Movie Storage Server VPS's own address instead — nothing
       # else here changes.
       STORAGE_ORIGIN: ${STORAGE_ORIGIN:-host.docker.internal:9000}
+      # Verifies the /s/<expires>/<sig>/ token on every media URL — must be
+      # the backend's STREAM_SIGNING_SECRET verbatim. `:?` makes compose
+      # refuse to start the container when the value is unset OR empty. A
+      # plain ${STREAM_SIGNING_SECRET} would not: compose passes an unset
+      # variable through as "", envsubst renders `secure_link_md5 "$exp
+      # $scope "`, and nginx starts happily accepting tokens anyone can
+      # compute with the empty secret.
+      STREAM_SIGNING_SECRET: ${STREAM_SIGNING_SECRET:?STREAM_SIGNING_SECRET must be set in cacheserver/.env (same value as backend/.env)}
+      # Rollout switch for token-less video/audio/book URLs: "allow" while
+      # old clients still hold plain links, "deny" (the default) once every
+      # client fetches signed ones. Never-servable media is refused either
+      # way — video and audio originals, subtitles/, documents/ and temp/ —
+      # see the map at the top of nginx/templates/default.conf.template.
+      LEGACY_UNSIGNED_MEDIA: ${LEGACY_UNSIGNED_MEDIA:-deny}
     ports:
       - "${CACHE_PORT:-8080}:8080"
     volumes:

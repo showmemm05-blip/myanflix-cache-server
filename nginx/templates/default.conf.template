@@ -1,3 +1,30 @@
+# Which UNSIGNED bucket paths are refused outright. The five arms ABOVE the
+# `~^allow:` line are unconditional — they are refused in BOTH legacy modes,
+# because none of them is something a player ever fetches. They are the
+# SOURCE side of the layout (see backend/src/common/storage/media-taxonomy.ts):
+# an archived original.* upload, every uploaded subtitle source under
+# subtitles/, every document under documents/ (chapter PDFs live at
+# documents/books/<b>/<e>/<c>/original.pdf), and the temp/ staging namespace.
+# All of those are read by the backend itself over credentialed S3, never
+# through this cache, so no rollout window applies to them.
+#
+# The rest is the rollout switch: LEGACY_UNSIGNED_MEDIA=allow keeps token-less
+# HLS/page URLs working while old clients still hold them; =deny (the default)
+# makes the signed locations below the ONLY way to a video segment, an audio
+# segment or a book page. Images (/movies/images/**) are never listed here —
+# posters and avatars stay plain and public, that is the whole point of a
+# browsable catalogue.
+map "${LEGACY_UNSIGNED_MEDIA}:$uri" $deny_unsigned_media {
+    ~^[^:]*:/movies/videos/[^/]+/original\.   1;
+    ~^[^:]*:/movies/audio/[^/]+/original\.    1;
+    ~^[^:]*:/movies/subtitles/                1;
+    ~^[^:]*:/movies/documents/                1;
+    ~^[^:]*:/movies/temp/                     1;
+    ~^allow:                                  0;
+    ~^[^:]*:/movies/(videos|audio|books)/     1;
+    default                                   0;
+}
+
 upstream storage_origin {
     server ${STORAGE_ORIGIN};
 }
@@ -10,16 +37,18 @@ server {
     proxy_set_header Host $host;
     proxy_set_header Connection "";
 
-    # Wildcard, not an origin allowlist — this is read-only public HLS
-    # content; the real access control already happened earlier (the
-    # backend only hands a viewer a stream URL after checking movie
-    # ownership). CORS here only governs whether cross-origin JS can
-    # *read* the response, which the custom HLS prefetch player needs
-    # (it fetches via XHR/fetch, not a plain <video src>). Needed for
-    # any origin that legitimately runs userwebsite, present or future,
-    # without maintaining a per-environment origin list here too.
+    # Wildcard, not an origin allowlist. This cache IS the access-control
+    # point for media now — but the control is the signed token in the
+    # request PATH (checked by the /s/... locations below), not the caller's
+    # origin: a token is minted by the backend only after it has verified
+    # the viewer's subscription, and it is worthless once it expires. CORS
+    # here only governs whether cross-origin JS can *read* the response,
+    # which the custom HLS prefetch player needs (it fetches via XHR/fetch,
+    # not a plain <video src>). Needed for any origin that legitimately runs
+    # userwebsite, present or future, without maintaining a per-environment
+    # origin list here too.
     #
-    # Set at server level so both locations below inherit one identical set:
+    # Set at server level so every location below inherits one identical set:
     # an add_header anywhere inside a location would silently drop these.
     add_header Access-Control-Allow-Origin * always;
     # Content-Range/Accept-Ranges: byte-range seeking. ETag: the
@@ -27,25 +56,27 @@ server {
     add_header Access-Control-Expose-Headers "Content-Range, Content-Length, Accept-Ranges, ETag" always;
     add_header X-Cache-Status $upstream_cache_status always;
 
-    # Cache keyed on path only, ignoring the query string. Presigned
-    # URLs carry a unique signature + expiry per request, so keying on
-    # the full URL would give every viewer's link its own cache entry
-    # and never actually share a hit — this way every viewer requesting
-    # the same segment hits the same cache entry.
+    # Cache keyed on the OBJECT path only — the query string is ignored, and
+    # in the signed locations the /s/<expires>/<sig>/ prefix is stripped from
+    # the key too (each of them restates proxy_cache_key without it). Every
+    # token ever minted for one segment therefore lands on one cache entry:
+    # a viewer whose link was signed at 14:00 and one whose link was signed
+    # at 15:00 share a HIT, and an entry cached before this token scheme
+    # existed carries straight over (the key string is byte-identical).
     #
-    # Known tradeoff: because of that, a cache HIT never reaches the
-    # storage origin, which means a cached response is served without
-    # re-checking whether *this specific* request's presigned signature
-    # is valid or expired. That's fine as long as permission is enforced
-    # before a URL is ever handed out (the app server only gives a
-    # viewer a URL after confirming they own the movie) — it stops being
-    # fine if this cache is ever treated as the sole access-control
-    # point. If per-request revocation ever matters, add a
-    # token-validation step (auth_request) in front of this location.
+    # The consequence to understand: the token is verified by THIS request
+    # (secure_link runs before the cache lookup, on HIT and MISS alike), but
+    # what is verified is "a valid, unexpired token for this title's scope",
+    # never "this particular viewer". Anyone holding a live link for a title
+    # can play that title until the link expires; per-viewer binding would
+    # need an auth_request round trip to the backend per segment, which is
+    # exactly the origin load this cache exists to remove. Revoking a
+    # subscription therefore takes effect at the next stream lookup, not
+    # mid-segment.
     #
-    # It also means a cache-busting query string CANNOT be used to force a
-    # refresh of a mutable object — which is why freshness has to come from
-    # the TTL split below rather than from the publisher's URLs.
+    # Ignoring the query string also means a cache-busting query string
+    # CANNOT force a refresh of a mutable object — which is why freshness has
+    # to come from the TTL split below rather than from the publisher's URLs.
     proxy_cache movie_cache;
     proxy_cache_key "$scheme$request_method$host$uri";
     proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
@@ -63,7 +94,93 @@ server {
     # rendition whose objects are gone. A few seconds is short enough that an
     # admin edit shows up on the next play, long enough to still absorb the
     # herd at the start of a popular title.
+    #
+    # ---- Signed media: /s/<expires>/<signature>/movies/<scope>/<rest> ----
+    #
+    # The backend (MinioService.signedPlaybackUrl) puts the token in the
+    # PATH, not the query string, for one reason: a playlist's segment URIs
+    # are relative (`720p/index.m3u8`, `segment_007.ts`), and every player
+    # resolves them against the playlist's own URL — so a prefix on the
+    # master URL is inherited by every segment for free, while a query
+    # string would be dropped at the first relative hop. The token signs the
+    # SCOPE (one title's hls/ folder, one chapter's pages/ folder, one
+    # movie's subtitle-source folder `subtitles/<movieId>`), so a single
+    # token covers everything under it.
+    #
+    #   secure_link_md5 "<expires> <scope> <secret>"  ==  base64url(md5(...))
+    #
+    # is the contract with backend/src/common/storage/stream-signature.ts,
+    # and ${STREAM_SIGNING_SECRET} must be the backend's STREAM_SIGNING_SECRET
+    # verbatim. $secure_link is "" for a bad signature (403), "0" for a good
+    # signature past its expiry (410 — the clients treat that as "fetch a
+    # fresh link", a 403 as "give up"), "1" to proceed.
+    #
+    # The scope alternation is GENERATED — it is not written by hand here.
+    # `npx ts-node scripts/print-stream-scopes.ts` in the backend prints it
+    # from MEDIA_CLASSES, and nginx-scopes.spec.ts fails when this file no
+    # longer contains that exact string EXACTLY TWICE. It has to be identical
+    # in both locations: changing one and forgetting the other breaks
+    # playlists but not segments (or the reverse), which shows up as flaky
+    # playback rather than as a config error. These two locations must also
+    # precede the unsigned `\.(m3u8|vtt)$` one — nginx takes the first
+    # matching regex location in file order — or a signed playlist would fall
+    # through to the legacy handling.
+    #
+    # Playlists/subtitle text first (short TTL), then everything else under a
+    # signed prefix (long TTL). Both restate the cache key WITHOUT the token
+    # prefix — see the proxy_cache_key note above. The regexes are quoted
+    # because nginx's config parser would otherwise trip on the `{36}`.
+    location ~ "^/s/(?<exp>\d+)/(?<sig>[\w-]+)/movies/(?<scope>videos/[0-9a-f-]{36}/hls|audio/[0-9a-f-]{36}/hls|subtitles/[0-9a-f-]{36}|books/[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/pages)/(?<rest>.+\.(m3u8|vtt))$" {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Range, Content-Type" always;
+            add_header Access-Control-Max-Age 86400 always;
+            add_header Content-Length 0;
+            add_header Content-Type text/plain;
+            return 204;
+        }
+
+        secure_link $sig,$exp;
+        secure_link_md5 "$exp $scope ${STREAM_SIGNING_SECRET}";
+        if ($secure_link = "") { return 403; }
+        if ($secure_link = "0") { return 410; }
+
+        proxy_cache_key "$scheme$request_method$host/movies/$scope/$rest";
+        proxy_pass http://storage_origin/movies/$scope/$rest;
+
+        proxy_cache_valid 200 206 10s;
+        proxy_cache_valid 404 1m;
+    }
+
+    location ~ "^/s/(?<exp>\d+)/(?<sig>[\w-]+)/movies/(?<scope>videos/[0-9a-f-]{36}/hls|audio/[0-9a-f-]{36}/hls|subtitles/[0-9a-f-]{36}|books/[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/pages)/(?<rest>.+)$" {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Range, Content-Type" always;
+            add_header Access-Control-Max-Age 86400 always;
+            add_header Content-Length 0;
+            add_header Content-Type text/plain;
+            return 204;
+        }
+
+        secure_link $sig,$exp;
+        secure_link_md5 "$exp $scope ${STREAM_SIGNING_SECRET}";
+        if ($secure_link = "") { return 403; }
+        if ($secure_link = "0") { return 410; }
+
+        proxy_cache_key "$scheme$request_method$host/movies/$scope/$rest";
+        proxy_pass http://storage_origin/movies/$scope/$rest;
+
+        proxy_cache_valid 200 206 7d;
+        proxy_cache_valid 404 1m;
+    }
+
+    # ---- Unsigned paths: images always, video/book media only while ----
+    # ---- LEGACY_UNSIGNED_MEDIA=allow (see the map at the top).       ----
     location ~* \.(m3u8|vtt)$ {
+        if ($deny_unsigned_media) { return 403; }
+
         if ($request_method = OPTIONS) {
             add_header Access-Control-Allow-Origin * always;
             add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
@@ -82,10 +199,12 @@ server {
         proxy_cache_valid 404 1m;
     }
 
-    # Everything else: media segments, images, and the rest of the bucket.
-    # These are written once under a content-addressed-enough key and never
-    # rewritten, so a long TTL is exactly right.
+    # Everything else: images, and (legacy switch only) unsigned media
+    # segments. These are written once under a content-addressed-enough key
+    # and never rewritten, so a long TTL is exactly right.
     location / {
+        if ($deny_unsigned_media) { return 403; }
+
         # Preflight — browsers send this before a cross-origin GET that
         # carries a Range header on some implementations. Answered here
         # directly rather than forwarded upstream, since the storage origin
