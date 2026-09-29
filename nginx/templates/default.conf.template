@@ -37,6 +37,19 @@ server {
     proxy_set_header Host $host;
     proxy_set_header Connection "";
 
+    # MinIO judges the bucket policy's aws:SourceIp (anonymous reads only
+    # from this cache's address — ../../storage-server/policies/) by
+    # X-Forwarded-For / X-Real-IP / Forwarded BEFORE the socket address, and
+    # nginx forwards whatever the viewer sent. Passed through, a viewer's
+    # header — or one added by a TLS proxy in front of this cache — would make
+    # MinIO judge a MISS by the viewer's address and refuse it. Blank values
+    # make nginx drop the three headers, so MinIO only ever sees this cache.
+    # Kept at server level on purpose: a location that sets any
+    # proxy_set_header of its own inherits none of these.
+    proxy_set_header X-Forwarded-For "";
+    proxy_set_header X-Real-IP "";
+    proxy_set_header Forwarded "";
+
     # Wildcard, not an origin allowlist. This cache IS the access-control
     # point for media now — but the control is the signed token in the
     # request PATH (checked by the /s/... locations below), not the caller's

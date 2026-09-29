@@ -171,7 +171,12 @@ the catalogue is quiet, or accept one round of client-side recovery.
    address(es), forwarded-IP headers stripped on the upload proxy, port 9000
    firewalled. That is what stops the direct `:9000` / `:8443` download the
    QA report reproduced; the token work above is what stops the same
-   download *through this cache*.
+   download *through this cache*. Recreate this cache with the current
+   template **before** that bucket policy goes on: the template blanks the
+   viewer's `X-Forwarded-For` / `X-Real-IP` / `Forwarded` on the way to
+   storage, because MinIO checks the policy's allowed address against those
+   headers first, and a viewer's (or a TLS proxy's) header would otherwise
+   get every cache MISS refused.
 
 The secret ends up in the rendered `/etc/nginx/conf.d/default.conf` inside
 the container — root-readable on the cache VPS, the same exposure class as
@@ -186,3 +191,12 @@ address, set the two token variables as above, and deploy this same
 image/config to the cache VPS. The second cache server named in the
 deployment plan needs exactly the same `.env` (same secret) and its address
 added to the storage bucket policy and firewall.
+
+On the backend side, a cache with its own address also needs
+`STREAM_PUBLIC_BASE_URL=https://<cache-host>` **and**
+`STREAM_PUBLIC_BASE_URL_IS_PUBLIC=true` in `backend/.env`. Without the flag
+the backend keeps only the port of that base and swaps in the API's host, so
+every playback link and poster would point at the API VPS, where no cache
+runs. With `NODE_ENV=production` the backend refuses to start while the flag
+is empty and the base is a public address (see `backend/DOCKER.md`, "Moving
+to the real VPS").

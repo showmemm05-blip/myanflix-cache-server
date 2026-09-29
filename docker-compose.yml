@@ -6,6 +6,9 @@ services:
   # bundled into this compose project, matching the real two-VPS split.
   cache:
     image: nginx:alpine
+    # Without this, a crash or host reboot leaves the service down until
+    # someone notices and starts it by hand.
+    restart: unless-stopped
     environment:
       # Local: MinIO published on the host machine (../storage-server),
       # reached via Docker's host.docker.internal. Real deployment: point
