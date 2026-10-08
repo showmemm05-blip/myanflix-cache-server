@@ -59,6 +59,28 @@ playlist's segment URIs are relative — the player inherits the prefix for
 every segment without knowing the scheme exists. The query string is still
 ignored.
 
+### What the logs hold
+
+The **access log** (every request, nginx stdout) never holds a usable token:
+`nginx.conf` logs the path with the signature segment masked
+(`/s/<expires>/-/...`). The query string is still logged, as before; the only
+other difference from the old `"$request"` line is that a request line nginx
+could not parse at all (status 400) now logs blank instead of its raw bytes.
+The `Server` header carries no nginx version (`server_tokens off`).
+
+nginx's own **error log** (stderr, `warn` level) is the one place a live token
+can still appear: when the storage origin fails or times out, the `[error]`
+line nginx writes has no masking hook and includes the raw request line
+(`request: "GET /s/<expires>/<signature>/..."`). Successful requests never
+reach it, so this is only ever a handful of lines, only during an origin
+outage. It is accepted rather than silenced: the `crit` level would hide
+exactly the upstream failures this log exists to show, and whoever can read
+`docker logs` on the cache VPS is root there, where the signing secret
+already sits in the rendered `/etc/nginx/conf.d/default.conf` (see below), so
+the error log gives them nothing new. It matters only when logs *travel*:
+ship or paste **stdout only**, or scrub `request: "` lines, before sending
+cache logs anywhere.
+
 What is checked is "a live token for this title", not "this viewer": anyone
 holding a link can play that one title until the link expires (12 h by
 default, minted on hour boundaries — so 11–12 h). That is the price of one
@@ -133,6 +155,55 @@ A book chapter is the same recipe with `SCOPE="books/<b>/<e>/<c>/pages"` and
 Two different valid tokens for one segment (mint a second one with
 `EXP2=$((EXP + 3600))`) must give `HIT` on the second request: the cache key
 drops the token prefix, so every token shares one entry.
+
+## Changing `nginx.conf` or the template
+
+`nginx.conf` is bind-mounted as a single file. Docker Desktop caches that
+file's *size* from when the container was created, so after editing it the
+running container can see the new text cut off at the old length — `docker
+compose restart cache` would then start nginx on a truncated file and fail.
+Always **recreate**, and test the real file first with a throwaway copy:
+
+```bash
+docker exec -i cacheserver-cache-1 sh -c 'cat > /tmp/t.conf && nginx -t -c /tmp/t.conf; rm -f /tmp/t.conf' < nginx/nginx.conf
+# nginx: configuration file /tmp/t.conf test is successful
+docker compose up -d --force-recreate cache
+docker compose logs --tail 20 cache        # no [emerg] line
+curl -sI localhost:8080/ | grep -i '^server:'   # Server: nginx  (no version)
+# after one signed request (smoke test below) the newest log line reads
+# "GET /s/<expires>/-/movies/videos/<id>/hls/master.m3u8 HTTP/1.1" — the
+# signature segment is a dash
+```
+
+The template is filled in (envsubst) again on **every start** of the
+container, but with the environment values the container was **created**
+with: `STORAGE_ORIGIN`, `STREAM_SIGNING_SECRET` and `LEGACY_UNSIGNED_MEDIA`.
+Never add a NEW `${...}` value to the template without recreating the
+container in the same step: a container created before that variable existed
+does not have it, so on its next start (`docker compose restart`, a Docker
+Desktop restart, a reboot, or its own `unless-stopped` restart) nginx reads
+the literal text, refuses to start, and nothing plays. That is why the cache
+size (`max_size=5g` in the template) is a plain number: on the real cache VPS
+edit it to about 70-80% of the free disk and recreate the container. Both
+files are bind-mounted, so a running container already sees the version on
+disk and picks it up on its next start. To
+test a template change before recreating, render it with the same values
+into a temp folder and run `nginx -t` in a throwaway `nginx:alpine`
+container with both files mounted read-only.
+
+Optional, once, on the first deploy of this version: older versions stored a
+separate cache copy of the same file per website address (`Origin`) and per
+browser encoding list (`Accept-Encoding`). The new config no longer uses
+those copies; nginx deletes them by itself after 7 days unused, and until
+then they only use part of the cache's `max_size` space. To clear them at once,
+recreate the cache with an empty volume (it refills from the storage origin
+as people watch, so the first plays afterwards are cache misses):
+
+```bash
+docker compose down -v      # removes the cache container and ONLY this project's cache-data volume
+docker compose up -d cache
+docker compose logs --tail 20 cache        # no [emerg] line
+```
 
 ## Rollout runbook (production)
 

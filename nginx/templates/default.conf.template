@@ -25,8 +25,30 @@ map "${LEGACY_UNSIGNED_MEDIA}:$uri" $deny_unsigned_media {
     default                                   0;
 }
 
+# Browser lifetime (Cache-Control max-age) for the signed "everything else"
+# location below, chosen by the token's scope. Segments and book pages are
+# immutable at their key: 30 days. Uploaded subtitle sources under
+# subtitles/<movieId>/ keep the operator's own file name and may be replaced
+# in place: 10 seconds, the same as playlists and .vtt text.
+map $scope $signed_media_expires {
+    ~^subtitles/   10s;
+    default        30d;
+}
+
+# The cache itself: where it lives, the movie_cache zone every location
+# uses, and its total size on disk. max_size is a plain number on purpose
+# (5g, as before): a ${...} value here would leave a container created
+# before that variable existed unable to start after any restart. On the
+# real cache VPS edit the number to about 70-80% of the free disk and
+# recreate the container. Entries unused for 7 days are dropped.
+proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=movie_cache:100m max_size=5g inactive=7d use_temp_path=off;
+
 upstream storage_origin {
     server ${STORAGE_ORIGIN};
+    # Reuse open connections to the storage origin instead of opening a new
+    # TCP connection for every cache MISS. Needs proxy_http_version 1.1 and
+    # an empty Connection header, both set in the server block below.
+    keepalive 32;
 }
 
 server {
@@ -49,6 +71,30 @@ server {
     proxy_set_header X-Forwarded-For "";
     proxy_set_header X-Real-IP "";
     proxy_set_header Forwarded "";
+    # Same blanking, for cache efficiency rather than the bucket policy: MinIO
+    # answers "Vary: Origin" and "Vary: Accept-Encoding", and nginx stored a
+    # separate copy of the same object for every website address and every
+    # browser's encoding list. The bytes never differ by either (this cache
+    # sets the CORS headers itself, and MinIO does not compress), so neither
+    # header is forwarded and Vary from MinIO is ignored and not passed on.
+    # nginx's own gzip still sends a correct Vary to viewers (gzip_vary).
+    proxy_set_header Origin "";
+    proxy_set_header Accept-Encoding "";
+    proxy_ignore_headers Vary;
+    proxy_hide_header Vary;
+
+    # MinIO's internal headers are no use to a viewer: request ids, its rate
+    # limit counters, an old XSS header, and an HSTS header that means
+    # nothing over plain HTTP (a TLS proxy in front sets its own). ETag,
+    # Last-Modified, Content-Range, Accept-Ranges and X-Content-Type-Options
+    # are kept. Like proxy_set_header, these are only inherited by locations
+    # that define no proxy_hide_header of their own, so none of them does.
+    proxy_hide_header X-Amz-Id-2;
+    proxy_hide_header X-Amz-Request-Id;
+    proxy_hide_header X-Ratelimit-Limit;
+    proxy_hide_header X-Ratelimit-Remaining;
+    proxy_hide_header X-Xss-Protection;
+    proxy_hide_header Strict-Transport-Security;
 
     # Wildcard, not an origin allowlist. This cache IS the access-control
     # point for media now — but the control is the signed token in the
@@ -95,6 +141,12 @@ server {
     proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
     proxy_cache_lock on;
     proxy_cache_lock_timeout 30s;
+    # When a playlist's 10 s runs out, keep serving the old copy while ONE
+    # background request refreshes it, instead of making a viewer wait on the
+    # storage round trip. The refresh asks "changed since?" (ETag /
+    # Last-Modified), so an unchanged playlist comes back as a tiny 304.
+    proxy_cache_background_update on;
+    proxy_cache_revalidate on;
 
     # Playlists and subtitle text are MUTABLE at a stable key, unlike segment
     # bytes. master.m3u8 in particular is rewritten in place every time a
@@ -164,6 +216,10 @@ server {
 
         proxy_cache_valid 200 206 10s;
         proxy_cache_valid 404 1m;
+        # Tell browsers the same 10 s (Cache-Control: max-age=10). `expires`,
+        # unlike add_header, keeps the server-level CORS headers, and it only
+        # applies to 2xx/3xx, so the 403/410 token answers stay uncached.
+        expires 10s;
     }
 
     location ~ "^/s/(?<exp>\d+)/(?<sig>[\w-]+)/movies/(?<scope>videos/[0-9a-f-]{36}/hls|audio/[0-9a-f-]{36}/hls|subtitles/[0-9a-f-]{36}|books/[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/pages)/(?<rest>.+)$" {
@@ -187,6 +243,13 @@ server {
 
         proxy_cache_valid 200 206 7d;
         proxy_cache_valid 404 1m;
+        # Segments and book pages are never rewritten at the same key (a
+        # replace goes to a new v-<tag>/ folder), so browsers may keep them
+        # for 30 days. Uploaded subtitle sources (subtitles/<movieId>/, e.g.
+        # an .srt from a bulk bundle) keep the operator's own file name and
+        # can be re-uploaded under it, so they get the same 10 s as subtitle
+        # text — see the $signed_media_expires map at the top.
+        expires $signed_media_expires;
     }
 
     # ---- Unsigned paths: images always, video/book media only while ----
@@ -210,6 +273,7 @@ server {
         # sets one replaces every inherited rule, so both codes are restated.
         proxy_cache_valid 200 206 10s;
         proxy_cache_valid 404 1m;
+        expires 10s;
     }
 
     # Everything else: images, and (legacy switch only) unsigned media
@@ -236,5 +300,8 @@ server {
 
         proxy_cache_valid 200 206 7d;
         proxy_cache_valid 404 1m;
+        # Images are stored under a fresh <uuid> or <timestamp> name on every
+        # upload, never overwritten, so a long browser lifetime is safe.
+        expires 30d;
     }
 }

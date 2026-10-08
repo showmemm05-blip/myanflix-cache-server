@@ -29,6 +29,13 @@ services:
       # way — video and audio originals, subtitles/, documents/ and temp/ —
       # see the map at the top of nginx/templates/default.conf.template.
       LEGACY_UNSIGNED_MEDIA: ${LEGACY_UNSIGNED_MEDIA:-deny}
+    # One access-log line per segment adds up fast: keep at most 5 files of
+    # 50 MB (250 MB) instead of letting the log grow until the disk fills.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     ports:
       - "${CACHE_PORT:-8080}:8080"
     volumes:
