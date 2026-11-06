@@ -25,6 +25,19 @@ map "${LEGACY_UNSIGNED_MEDIA}:$uri" $deny_unsigned_media {
     default                                   0;
 }
 
+# Which token-less paths may reach the storage origin AT ALL. This cache
+# fronts exactly one bucket, and of that bucket only images are public by
+# key; the three media folders are listed so the LEGACY_UNSIGNED_MEDIA=allow
+# window keeps working (the map above still decides those). Everything else
+# — MinIO's own endpoints (/minio/health/*, /minio/admin/*), the bucket root,
+# another bucket, an unknown purpose folder — is answered 403 here and never
+# forwarded (SEC-022). The signed /s/ locations carry their own scope list.
+map $uri $outside_cache_scope {
+    ~^/movies/images/                  0;
+    ~^/movies/(videos|audio|books)/    0;
+    default                            1;
+}
+
 # Browser lifetime (Cache-Control max-age) for the signed "everything else"
 # location below, chosen by the token's scope. Segments and book pages are
 # immutable at their key: 30 days. Uploaded subtitle sources under
@@ -195,7 +208,7 @@ server {
     # signed prefix (long TTL). Both restate the cache key WITHOUT the token
     # prefix — see the proxy_cache_key note above. The regexes are quoted
     # because nginx's config parser would otherwise trip on the `{36}`.
-    location ~ "^/s/(?<exp>\d+)/(?<sig>[\w-]+)/movies/(?<scope>videos/[0-9a-f-]{36}/hls|audio/[0-9a-f-]{36}/hls|subtitles/[0-9a-f-]{36}|books/[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/pages)/(?<rest>.+\.(m3u8|vtt))$" {
+    location ~ "^/s/(?<exp>\d+)/(?<sig>[\w-]+)/movies/(?<scope>videos/[0-9a-f-]{36}/hls|audio/[0-9a-f-]{36}/hls|subtitles/[0-9a-f-]{36}|books/[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/pages|ads/[0-9a-f-]{36})/(?<rest>.+\.(m3u8|vtt))$" {
         if ($request_method = OPTIONS) {
             add_header Access-Control-Allow-Origin * always;
             add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
@@ -222,7 +235,7 @@ server {
         expires 10s;
     }
 
-    location ~ "^/s/(?<exp>\d+)/(?<sig>[\w-]+)/movies/(?<scope>videos/[0-9a-f-]{36}/hls|audio/[0-9a-f-]{36}/hls|subtitles/[0-9a-f-]{36}|books/[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/pages)/(?<rest>.+)$" {
+    location ~ "^/s/(?<exp>\d+)/(?<sig>[\w-]+)/movies/(?<scope>videos/[0-9a-f-]{36}/hls|audio/[0-9a-f-]{36}/hls|subtitles/[0-9a-f-]{36}|books/[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/pages|ads/[0-9a-f-]{36})/(?<rest>.+)$" {
         if ($request_method = OPTIONS) {
             add_header Access-Control-Allow-Origin * always;
             add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
@@ -252,9 +265,17 @@ server {
         expires $signed_media_expires;
     }
 
+    # MinIO's own endpoints (health, admin API) are not media and have no
+    # business answering through the public cache. `^~` makes this prefix
+    # win over the regex locations below, so not even /minio/x.m3u8 gets by.
+    location ^~ /minio/ {
+        return 403;
+    }
+
     # ---- Unsigned paths: images always, video/book media only while ----
     # ---- LEGACY_UNSIGNED_MEDIA=allow (see the map at the top).       ----
     location ~* \.(m3u8|vtt)$ {
+        if ($outside_cache_scope) { return 403; }
         if ($deny_unsigned_media) { return 403; }
 
         if ($request_method = OPTIONS) {
@@ -278,8 +299,12 @@ server {
 
     # Everything else: images, and (legacy switch only) unsigned media
     # segments. These are written once under a content-addressed-enough key
-    # and never rewritten, so a long TTL is exactly right.
+    # and never rewritten, so a long TTL is exactly right. Only
+    # /movies/images/** gets past the two checks in the default (deny) mode;
+    # anything outside the bucket's served folders is refused here, never at
+    # MinIO ($outside_cache_scope, see the top).
     location / {
+        if ($outside_cache_scope) { return 403; }
         if ($deny_unsigned_media) { return 403; }
 
         # Preflight — browsers send this before a cross-origin GET that

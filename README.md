@@ -20,6 +20,13 @@ The cache server listens on `http://localhost:8080` and forwards to whatever
 `STORAGE_ORIGIN` in `.env` points at (defaults to `../storage-server`'s MinIO,
 reached via `host.docker.internal:9000`).
 
+`docker compose ps` shows `(healthy)` once the container's own check passes
+(`nginx -t` plus one local `GET /`, which the template answers 403 itself —
+nothing is forwarded to the storage origin). Docker marks a failing container
+unhealthy but does not restart it for that; the 5 × 50 MB log cap was already
+here. See `../backend/DOCKER.md`, "Health checks, start order and log
+rotation".
+
 `.env` needs two more values than it used to (see `.env.example`):
 `STREAM_SIGNING_SECRET`, which must be byte-for-byte the backend's
 `STREAM_SIGNING_SECRET`, and `LEGACY_UNSIGNED_MEDIA` (`allow` / `deny`).
@@ -91,6 +98,12 @@ Paths without a token: `/movies/images/**` (posters, covers, avatars) stay
 plain and public — that is what makes the catalogue browsable to a signed-out
 visitor, and it is why nothing private is ever filed under `images/`.
 
+Nothing else token-less leaves the cache (since 2026-10-09, SEC-022): MinIO's
+own endpoints (`/minio/health/*`, `/minio/admin/*`), the bucket root, any
+other bucket and any unknown folder of `movies/` are answered **403** by nginx
+itself and never forwarded, in both legacy modes. Before, every unmatched path
+was proxied and `/minio/health/live` answered 200 through the public cache.
+
 Refused (**403**) token-less in BOTH legacy modes — the `allow` switch below
 does not reach them:
 
@@ -146,6 +159,8 @@ curl -sI "$BASE/s/$EXP/${SIG}x/movies/$SCOPE/master.m3u8" | head -1      # 403 �
 OLD=$(( EXP - 86400 )); OLDSIG=$(printf '%s %s %s' "$OLD" "$SCOPE" "$SECRET" | openssl md5 -binary | openssl base64 | tr '+/' '-_' | tr -d '=')
 curl -sI "$BASE/s/$OLD/$OLDSIG/movies/$SCOPE/master.m3u8" | head -1      # 410 — expired
 curl -sI "$BASE/movies/images/movie/<image-uuid>.jpg" | head -1          # 200 — images stay public
+curl -sI "$BASE/minio/health/live" | head -1                             # 403 — MinIO's own endpoints never leave the cache
+curl -sI "$BASE/other-bucket/x.jpg" | head -1                            # 403 — only the movies bucket's served folders
 curl -si -X OPTIONS "$BASE/s/$EXP/$SIG/movies/$SCOPE/master.m3u8" | grep -i 'HTTP/\|access-control-allow'  # 204 + CORS
 ```
 
